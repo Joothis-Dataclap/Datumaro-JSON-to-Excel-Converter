@@ -1,0 +1,294 @@
+import streamlit as st
+import json
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import io
+import time
+
+
+# Center the page with CSS
+st.markdown("""
+    <style>
+        .main { max-width: 1200px; margin: 0 auto; }
+        [data-testid="stAppViewContainer"] { padding-top: 2rem; }
+    </style>
+""", unsafe_allow_html=True)
+
+
+@st.cache_data
+def parse_datumaro_json(json_data):
+    """
+    Parse Datumaro JSON format and extract annotation data
+    Returns: list of dicts with image_name, frame_number, and label annotations
+    """
+    try:
+        data = json.loads(json_data) if isinstance(json_data, str) else json_data
+        
+        # Build label_id to label_name mapping from categories
+        label_map = {}
+        if "categories" in data and "label" in data["categories"]:
+            labels = data["categories"]["label"].get("labels", [])
+            for idx, label_obj in enumerate(labels):
+                label_map[idx] = label_obj.get("name", f"Label_{idx}")
+        
+        # Extract items from Datumaro format
+        items = data.get("items", [])
+        annotations_data = []
+        
+        for frame_number, item in enumerate(items, start=1):
+            image_name = item.get("id", "")
+            
+            # Extract annotations for this image
+            annotations = item.get("annotations", [])
+            label_counts = {}
+            
+            for annotation in annotations:
+                label_id = annotation.get("label_id", -1)
+                label_name = label_map.get(label_id, f"Unknown_{label_id}")
+                annotation_type = annotation.get("type", "")
+                
+                if label_name not in label_counts:
+                    label_counts[label_name] = {"box": 0, "polygon": 0}
+                
+                # Count by type
+                if annotation_type == "bbox":
+                    label_counts[label_name]["box"] += 1
+                elif annotation_type == "polygon":
+                    label_counts[label_name]["polygon"] += 1
+            
+            annotations_data.append({
+                "image_name": image_name,
+                "frame_number": frame_number,
+                "label_counts": label_counts
+            })
+        
+        return annotations_data
+    
+    except json.JSONDecodeError as e:
+        st.error(f"Invalid JSON format: {str(e)}")
+        return None
+    except Exception as e:
+        st.error(f"Error parsing JSON: {str(e)}")
+        return None
+
+
+@st.cache_data
+def create_excel_with_labels(json_data):
+    """
+    Create Excel file with dynamic label columns
+    Structure: SI No | Image Name | Frame Number | [Label 1 Box | Label 1 Polygon] | ... | Total Annotations
+    """
+    annotations_data = parse_datumaro_json(json_data)
+    if not annotations_data:
+        return None, None
+    
+    # Collect all unique labels
+    all_labels = set()
+    for item in annotations_data:
+        all_labels.update(item["label_counts"].keys())
+    all_labels = sorted(list(all_labels))
+    
+    # Prepare data for DataFrame
+    rows = []
+    for si, item in enumerate(annotations_data, 1):
+        row = {
+            "SI No": si,
+            "Image Name": item["image_name"],
+            "Frame Number": item["frame_number"]
+        }
+        
+        total_annotations = 0
+        for label in all_labels:
+            box_count = item["label_counts"].get(label, {}).get("box", 0)
+            polygon_count = item["label_counts"].get(label, {}).get("polygon", 0)
+            
+            row[f"{label} - Box"] = box_count
+            row[f"{label} - Polygon"] = polygon_count
+            total_annotations += box_count + polygon_count
+        
+        row["Total Annotations"] = total_annotations
+        rows.append(row)
+    
+    df = pd.DataFrame(rows)
+    
+    # Create Excel workbook with formatting
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Annotations"
+    
+    # Write headers
+    headers = ["SI No", "Image Name", "Frame Number"]
+    for label in all_labels:
+        headers.append(f"{label} - Box")
+        headers.append(f"{label} - Polygon")
+    headers.append("Total Annotations")
+    
+    ws.append(headers)
+    
+    # Format header row
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+    
+    # Add data rows
+    border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    for row_data in rows:
+        row_values = [
+            row_data["SI No"],
+            row_data["Image Name"],
+            row_data["Frame Number"]
+        ]
+        for label in all_labels:
+            row_values.append(row_data[f"{label} - Box"])
+            row_values.append(row_data[f"{label} - Polygon"])
+        row_values.append(row_data["Total Annotations"])
+        
+        ws.append(row_values)
+    
+    # Apply borders and alignment to all cells
+    for row in ws.iter_rows(min_row=2, max_row=len(rows)+1):
+        for cell in row:
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+    
+    # Adjust column widths
+    ws.column_dimensions['A'].width = 8
+    ws.column_dimensions['B'].width = 25
+    ws.column_dimensions['C'].width = 15
+    for col in range(4, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 14
+    
+    # Add summary row with totals
+    summary_row = len(rows) + 3
+    ws[f'A{summary_row}'] = "SUMMARY - Total Counts:"
+    ws[f'A{summary_row}'].font = Font(bold=True)
+    
+    # Add summary formulas for ALL columns (from D onwards to last column)
+    for col_idx in range(4, len(headers) + 1):
+        col_letter = get_column_letter(col_idx)
+        cell = ws[f'{col_letter}{summary_row}']
+        cell.value = f'=SUM({col_letter}2:{col_letter}{len(rows)+1})'
+        cell.font = Font(bold=True)
+        
+        # Color coding: Light green for label columns, light red for total
+        if col_idx == len(headers):  # Total Annotations column
+            cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        else:
+            cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    
+    return wb, df
+
+
+def main():
+    st.set_page_config(page_title="Datumaro JSON to Excel Converter", layout="wide")
+    st.title("🔄 Datumaro JSON to Excel Converter")
+    
+    uploaded_file = st.file_uploader(
+        "Choose a Datumaro JSON file",
+        type="json"
+    )
+    
+    if uploaded_file is not None:
+        try:
+            # Read JSON file
+            json_content = uploaded_file.read().decode("utf-8")
+            
+            # Parse and create Excel
+            msg_placeholder = st.empty()
+            msg_placeholder.info("📋 Processing JSON file...")
+            
+            wb, df = create_excel_with_labels(json_content)
+            
+            if df is None or df.empty:
+                st.error("No valid annotation data found in JSON file")
+                return
+            
+            msg_placeholder.success(f"✅ Found {len(df)} images with annotations")
+            time.sleep(3)
+            msg_placeholder.empty()
+            
+            # Download and Statistics at top
+            col_stats, col_download = st.columns([2, 1])
+            
+            with col_stats:
+                st.subheader("📈 Statistics")
+                stat_col1, stat_col2, stat_col3 = st.columns(3)
+                
+                with stat_col1:
+                    st.metric("Total Images", len(df))
+                
+                with stat_col2:
+                    st.metric("Total Annotations", int(df["Total Annotations"].sum()))
+                
+                with stat_col3:
+                    st.metric("Unique Labels", len([col for col in df.columns if "- Box" in col]))
+            
+            with col_download:
+                st.subheader("💾 Download")
+                
+                # Save to BytesIO (cache memory)
+                output_buffer = io.BytesIO()
+                wb.save(output_buffer)
+                output_buffer.seek(0)
+                
+                filename = f"{uploaded_file.name.split('.')[0]}_annotations.xlsx"
+                
+                st.download_button(
+                    label="📥 Download Excel",
+                    data=output_buffer.getvalue(),
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            
+            st.divider()
+            
+            # Data Preview
+            st.subheader("📊 Data Preview")
+            st.dataframe(df, use_container_width=True, height=500)
+            
+            # Label breakdown below
+            st.divider()
+            st.subheader("🏷️ Annotation Breakdown by Label")
+            label_cols = [col for col in df.columns if "- Box" in col]
+            
+            if label_cols:
+                label_stats = {}
+                for col in label_cols:
+                    label_name = col.replace(" - Box", "")
+                    box_col = f"{label_name} - Box"
+                    polygon_col = f"{label_name} - Polygon"
+                    
+                    box_count = df[box_col].sum()
+                    polygon_count = df[polygon_col].sum()
+                    
+                    label_stats[label_name] = {
+                        "Box": int(box_count),
+                        "Polygon": int(polygon_count),
+                        "Total": int(box_count + polygon_count)
+                    }
+                
+                stats_df = pd.DataFrame(label_stats).T
+                st.dataframe(stats_df, use_container_width=True)
+        
+        except Exception as e:
+            st.error(f"❌ Error processing file: {str(e)}")
+            import traceback
+            st.error(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    main()
