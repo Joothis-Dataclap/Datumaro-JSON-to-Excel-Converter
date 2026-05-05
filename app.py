@@ -37,7 +37,7 @@ def parse_datumaro_json(json_data):
         items = data.get("items", [])
         annotations_data = []
         
-        for frame_number, item in enumerate(items, start=1):
+        for frame_number, item in enumerate(items, start=0):
             image_name = item.get("id", "")
             
             # Extract annotations for this image
@@ -220,6 +220,18 @@ def main():
             time.sleep(3)
             msg_placeholder.empty()
             
+            # Extract job names from image names
+            df['Job'] = df['Image Name'].str.split('_').str[0]
+            
+            # Get all label columns
+            label_cols = [col for col in df.columns if "- Box" in col]
+            selected_labels = sorted([col.replace(" - Box", "") for col in label_cols])
+            
+            # Use all data (no filters)
+            filtered_df = df.copy()
+            
+            st.divider()
+            
             # Download and Statistics at top
             col_stats, col_download = st.columns([2, 1])
             
@@ -228,23 +240,103 @@ def main():
                 stat_col1, stat_col2, stat_col3 = st.columns(3)
                 
                 with stat_col1:
-                    st.metric("Total Images", len(df))
+                    st.metric("Total Images", len(filtered_df))
                 
                 with stat_col2:
-                    st.metric("Total Annotations", int(df["Total Annotations"].sum()))
+                    st.metric("Total Annotations", int(filtered_df["Total Annotations"].sum()))
                 
                 with stat_col3:
-                    st.metric("Unique Labels", len([col for col in df.columns if "- Box" in col]))
+                    st.metric("Unique Labels", len(selected_labels))
             
             with col_download:
                 st.subheader("💾 Download")
                 
                 # Save to BytesIO (cache memory)
                 output_buffer = io.BytesIO()
-                wb.save(output_buffer)
+                
+                # Create Excel from filtered data
+                filtered_df_for_export = filtered_df.copy()
+                wb_filtered = Workbook()
+                ws = wb_filtered.active
+                ws.title = "Annotations"
+                
+                # Get headers for filtered labels (with Job column before Image Name)
+                headers = ["SI No", "Job", "Image Name", "Frame Number"]
+                for label in selected_labels:
+                    headers.append(f"{label} - Box")
+                    headers.append(f"{label} - Polygon")
+                headers.append("Total Annotations of the Image")
+                
+                ws.append(headers)
+                
+                # Format header row
+                header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                header_font = Font(bold=True, color="FFFFFF")
+                header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                
+                for cell in ws[1]:
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = header_alignment
+                
+                # Add data rows
+                border = Border(
+                    left=Side(style='thin'),
+                    right=Side(style='thin'),
+                    top=Side(style='thin'),
+                    bottom=Side(style='thin')
+                )
+                
+                for idx, row_data in filtered_df_for_export.iterrows():
+                    row_values = [
+                        row_data["SI No"],
+                        row_data["Job"],
+                        row_data["Image Name"],
+                        row_data["Frame Number"]
+                    ]
+                    for label in selected_labels:
+                        row_values.append(row_data[f"{label} - Box"])
+                        row_values.append(row_data[f"{label} - Polygon"])
+                    row_values.append(row_data["Total Annotations"])
+                    
+                    ws.append(row_values)
+                
+                # Apply borders and alignment to all data cells
+                for row in ws.iter_rows(min_row=2, max_row=len(filtered_df_for_export)+1):
+                    for cell in row:
+                        cell.border = border
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                
+                # Adjust column widths
+                ws.column_dimensions['A'].width = 8
+                ws.column_dimensions['B'].width = 15
+                ws.column_dimensions['C'].width = 25
+                ws.column_dimensions['D'].width = 15
+                for col in range(5, len(headers) + 1):
+                    ws.column_dimensions[get_column_letter(col)].width = 14
+                
+                # Add summary row with totals
+                summary_row = len(filtered_df_for_export) + 3
+                ws[f'A{summary_row}'] = "SUMMARY - Total Counts:"
+                ws[f'A{summary_row}'].font = Font(bold=True)
+                
+                # Add summary formulas for ALL columns (from E onwards to last column)
+                for col_idx in range(5, len(headers) + 1):
+                    col_letter = get_column_letter(col_idx)
+                    cell = ws[f'{col_letter}{summary_row}']
+                    cell.value = f'=SUM({col_letter}2:{col_letter}{len(filtered_df_for_export)+1})'
+                    cell.font = Font(bold=True)
+                    
+                    # Color coding: Light green for label columns, light red for total
+                    if col_idx == len(headers):  # Total Annotations column
+                        cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                    else:
+                        cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+                
+                wb_filtered.save(output_buffer)
                 output_buffer.seek(0)
                 
-                filename = f"{uploaded_file.name.split('.')[0]}_annotations.xlsx"
+                filename = f"{uploaded_file.name.split('.')[0]}_annotations_filtered.xlsx"
                 
                 st.download_button(
                     label="📥 Download Excel",
@@ -258,24 +350,30 @@ def main():
             
             # Data Preview
             st.subheader("📊 Data Preview")
-            st.dataframe(df, use_container_width=True, height=500)
+            # Reorder columns: SI No, Job, Image Name, Frame Number, then labels
+            col_order = ["SI No", "Job", "Image Name", "Frame Number"]
+            for label in selected_labels:
+                col_order.append(f"{label} - Box")
+                col_order.append(f"{label} - Polygon")
+            col_order.append("Total Annotations")
+            
+            display_df = filtered_df[col_order]
+            st.dataframe(display_df, use_container_width=True, height=500, hide_index=True)
             
             # Label breakdown below
             st.divider()
             st.subheader("🏷️ Annotation Breakdown by Label")
-            label_cols = [col for col in df.columns if "- Box" in col]
             
-            if label_cols:
+            if selected_labels:
                 label_stats = {}
-                for col in label_cols:
-                    label_name = col.replace(" - Box", "")
-                    box_col = f"{label_name} - Box"
-                    polygon_col = f"{label_name} - Polygon"
+                for label in selected_labels:
+                    box_col = f"{label} - Box"
+                    polygon_col = f"{label} - Polygon"
                     
-                    box_count = df[box_col].sum()
-                    polygon_count = df[polygon_col].sum()
+                    box_count = filtered_df[box_col].sum()
+                    polygon_count = filtered_df[polygon_col].sum()
                     
-                    label_stats[label_name] = {
+                    label_stats[label] = {
                         "Box": int(box_count),
                         "Polygon": int(polygon_count),
                         "Total": int(box_count + polygon_count)
