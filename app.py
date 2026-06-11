@@ -434,7 +434,27 @@ def polygon_point_counter_page():
             time.sleep(2)
             msg_placeholder.empty()
 
-            df = pd.DataFrame(polygon_rows)[["image_name", "label_name", "points_count"]].copy()
+            # Extract unique labels for checkbox selection
+            all_labels = sorted(list(set(row["label_name"] for row in polygon_rows)))
+
+            # Add checkbox section for label selection
+            st.subheader("🏷️ Select Labels to Include")
+            selected_labels = st.multiselect(
+                "Choose which labels to include in the analysis and download:",
+                options=all_labels,
+                default=all_labels,
+                key="label_filter"
+            )
+
+            # Validation: show warning if no labels selected
+            if not selected_labels:
+                st.warning("⚠️ Please select at least one label to proceed.")
+                return
+
+            # Filter polygon_rows based on selected labels
+            filtered_polygon_rows = [row for row in polygon_rows if row["label_name"] in selected_labels]
+
+            df = pd.DataFrame(filtered_polygon_rows)[["image_name", "label_name", "points_count"]].copy()
             df.insert(0, "SI No", range(1, len(df) + 1))
             df.columns = ["SI No", "Image Name", "Label Name", "Points Count"]
 
@@ -523,7 +543,7 @@ def polygon_point_counter_page():
                     cell.alignment = Alignment(horizontal="center", vertical="center")
 
                 label_groups = {}
-                for row in polygon_rows:
+                for row in filtered_polygon_rows:
                     ln = row["label_name"]
                     if ln not in label_groups:
                         label_groups[ln] = {"count": 0, "total_points": 0}
