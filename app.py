@@ -1026,6 +1026,654 @@ def json_split_merge_page():
                         st.error(traceback.format_exc())
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# QC HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_polygon_bbox(points):
+    """Return axis-aligned bounding box of a polygon: (x_min, y_min, x_max, y_max)."""
+    xs = points[0::2]
+    ys = points[1::2]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def bbox_of_bbox(bbox):
+    """bbox format [x, y, w, h] → (x_min, y_min, x_max, y_max)."""
+    x, y, w, h = bbox
+    return x, y, x + w, y + h
+
+
+def aabb_overlap(a, b):
+    """Check whether two AABBs (x1,y1,x2,y2) overlap."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    return not (ax2 <= bx1 or bx2 <= ax1 or ay2 <= by1 or by2 <= ay1)
+
+
+def aabb_contains(outer, inner, tolerance=0):
+    """Return True if inner AABB is fully inside outer AABB (with optional tolerance)."""
+    ox1, oy1, ox2, oy2 = outer
+    ix1, iy1, ix2, iy2 = inner
+    return (ix1 >= ox1 - tolerance and iy1 >= oy1 - tolerance and
+            ix2 <= ox2 + tolerance and iy2 <= oy2 + tolerance)
+
+
+def annotation_aabb(ann):
+    """Return AABB for any annotation (bbox or polygon)."""
+    t = ann.get("type", "")
+    if t == "bbox":
+        return bbox_of_bbox(ann["bbox"])
+    elif t == "polygon":
+        pts = ann.get("points", [])
+        if len(pts) >= 4:
+            return get_polygon_bbox(pts)
+    return None
+
+
+def parse_qc_data(json_data):
+    """
+    Parse Datumaro JSON and return:
+      - label_map: {id -> name}
+      - name_to_id: {name -> id}
+      - items: raw items list
+    """
+    data = json.loads(json_data) if isinstance(json_data, str) else json_data
+    label_map = {}
+    if "categories" in data and "label" in data["categories"]:
+        for idx, lbl in enumerate(data["categories"]["label"].get("labels", [])):
+            label_map[idx] = lbl.get("name", f"Label_{idx}")
+    return label_map, {v: k for k, v in label_map.items()}, data.get("items", [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 1 – Label summary (bbox / polygon counts per label)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def qc_check1_label_summary(items, label_map):
+    """Return a DataFrame: label | bbox_count | polygon_count | total."""
+    counts = {}
+    for item in items:
+        for ann in item.get("annotations", []):
+            lid = ann.get("label_id", -1)
+            name = label_map.get(lid, f"Unknown_{lid}")
+            t = ann.get("type", "")
+            if name not in counts:
+                counts[name] = {"BBox": 0, "Polygon": 0}
+            if t == "bbox":
+                counts[name]["BBox"] += 1
+            elif t == "polygon":
+                counts[name]["Polygon"] += 1
+    rows = [{"Label": k, "BBox": v["BBox"], "Polygon": v["Polygon"],
+             "Total": v["BBox"] + v["Polygon"]} for k, v in sorted(counts.items())]
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 2 – Nested labels inside a selected label
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _point_in_polygon(px, py, flat_points):
+    """Ray-casting: is (px,py) strictly inside the polygon given as flat [x,y,...] list?"""
+    xs = flat_points[0::2]
+    ys = flat_points[1::2]
+    n = len(xs)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = xs[i], ys[i]
+        xj, yj = xs[j], ys[j]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def child_fully_inside_parent(child_ann, parent_ann, tolerance=5):
+    """
+    Return True when the child annotation is **fully contained** inside
+    the parent annotation shape.
+
+    Logic (same for Check 2 and Check 4 — both are the same concept):
+
+    • parent is bbox    → child AABB must be fully within parent AABB.
+    • parent is polygon → (a) child AABB must be fully within parent AABB
+                          (b) ALL FOUR CORNERS of child AABB must pass a
+                              ray-casting test against the parent polygon.
+
+    Why all-four-corners instead of centre-only?
+    Walls sit exactly on the Room polygon boundary — their centre can land
+    just inside the bbox but their corners straddle the polygon edge.
+    Requiring all four corners to be inside the polygon correctly excludes
+    boundary-hugging walls and includes only genuine interior fixtures.
+    """
+    child_box = annotation_aabb(child_ann)
+    if child_box is None:
+        return False
+
+    p_type = parent_ann.get("type", "")
+
+    if p_type == "bbox":
+        parent_box = annotation_aabb(parent_ann)
+        if parent_box is None:
+            return False
+        return aabb_contains(parent_box, child_box, tolerance=tolerance)
+
+    elif p_type == "polygon":
+        pts = parent_ann.get("points", [])
+        if len(pts) < 6:
+            return False
+        parent_box = annotation_aabb(parent_ann)
+        if parent_box is None:
+            return False
+        # Quick AABB pre-filter
+        if not aabb_contains(parent_box, child_box, tolerance=tolerance):
+            return False
+        # All four corners of child must be strictly inside the parent polygon
+        cx1, cy1, cx2, cy2 = child_box
+        corners = [(cx1, cy1), (cx2, cy1), (cx2, cy2), (cx1, cy2)]
+        return all(_point_in_polygon(px, py, pts) for px, py in corners)
+
+    return False
+
+
+def _annotation_area(ann):
+    """Area of an annotation's bounding box in square pixels."""
+    box = annotation_aabb(ann)
+    if box:
+        return (box[2] - box[0]) * (box[3] - box[1])
+    return 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 2 – Nested labels inside a selected label
+# (same containment concept as Check 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def qc_check2_nested_labels(items, label_map, parent_label_name, ignore_labels, tolerance=5):
+    """
+    For every annotation of *parent_label_name*, compute its area and report
+    which other annotations are **fully contained** inside it.
+
+    Containment rule (same as Check 4):
+      • bbox parent  → child AABB fully within parent AABB
+      • polygon parent → all 4 child-corners inside the parent polygon
+        (this correctly excludes walls that straddle the polygon boundary)
+
+    Returns a list of result dicts, one per parent annotation found.
+    """
+    results = []
+    for item in items:
+        anns = item.get("annotations", [])
+        image_id = item.get("id", "")
+
+        parents = [a for a in anns
+                   if label_map.get(a.get("label_id", -1)) == parent_label_name]
+
+        for p_ann in parents:
+            p_id = p_ann.get("id", "N/A")
+            p_area = _annotation_area(p_ann)
+            p_box = annotation_aabb(p_ann)
+            nested = []
+
+            for a in anns:
+                a_name = label_map.get(a.get("label_id", -1), "")
+                if a_name == parent_label_name:
+                    continue
+                if a_name in ignore_labels:
+                    continue
+                if child_fully_inside_parent(a, p_ann, tolerance=tolerance):
+                    a_area = _annotation_area(a)
+                    nested.append({
+                        "nested_label": a_name,
+                        "nested_id": a.get("id", "N/A"),
+                        "nested_type": a.get("type", ""),
+                        "nested_area_px": round(a_area, 1),
+                        "nested_area_pct": round(a_area / p_area * 100, 2) if p_area > 0 else 0.0,
+                    })
+
+            results.append({
+                "image_id": image_id,
+                "parent_ann_id": p_id,
+                "parent_type": p_ann.get("type", ""),
+                "parent_area_px": round(p_area, 1),
+                "parent_bbox": (f"({p_box[0]:.1f},{p_box[1]:.1f})"
+                                f" → ({p_box[2]:.1f},{p_box[3]:.1f})") if p_box else "N/A",
+                "nested_count": len(nested),
+                "nested_labels": ", ".join(sorted(set(n["nested_label"] for n in nested))) if nested else "—",
+                "nested_details": nested,
+            })
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 3 – Gap between Room and surrounding labels (walls/windows/doors)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def qc_check3_room_gap(items, label_map, room_label, surrounding_labels, gap_threshold=10):
+    """
+    For each Room polygon, check whether every side of its bounding box
+    has at least one surrounding-label annotation within `gap_threshold` pixels.
+    Returns issues list.
+    """
+    issues = []
+    for item in items:
+        anns = item.get("annotations", [])
+        image_id = item.get("id", "")
+
+        rooms = [a for a in anns if label_map.get(a.get("label_id", -1)) == room_label]
+        surrounders = [a for a in anns if label_map.get(a.get("label_id", -1)) in surrounding_labels]
+
+        for room in rooms:
+            r_box = annotation_aabb(room)
+            if r_box is None:
+                continue
+            rx1, ry1, rx2, ry2 = r_box
+            room_id = room.get("id", "N/A")
+
+            gaps = []
+            nearby = []
+            for s in surrounders:
+                s_box = annotation_aabb(s)
+                if s_box is None:
+                    continue
+                sx1, sy1, sx2, sy2 = s_box
+                # Expand room box by gap_threshold and check overlap
+                expanded = (rx1 - gap_threshold, ry1 - gap_threshold,
+                            rx2 + gap_threshold, ry2 + gap_threshold)
+                if aabb_overlap(expanded, s_box):
+                    nearby.append({
+                        "id": s.get("id", "N/A"),
+                        "label": label_map.get(s.get("label_id", -1), ""),
+                        "type": s.get("type", ""),
+                        "bbox": s_box
+                    })
+
+            # Check four sides
+            sides = {
+                "Top": [n for n in nearby if n["bbox"][3] >= ry1 - gap_threshold and n["bbox"][1] <= ry1 + gap_threshold],
+                "Bottom": [n for n in nearby if n["bbox"][1] <= ry2 + gap_threshold and n["bbox"][3] >= ry2 - gap_threshold],
+                "Left": [n for n in nearby if n["bbox"][2] >= rx1 - gap_threshold and n["bbox"][0] <= rx1 + gap_threshold],
+                "Right": [n for n in nearby if n["bbox"][0] <= rx2 + gap_threshold and n["bbox"][2] >= rx2 - gap_threshold],
+            }
+
+            missing_sides = [side for side, nbrs in sides.items() if len(nbrs) == 0]
+            if missing_sides or len(nearby) == 0:
+                issues.append({
+                    "image_id": image_id,
+                    "room_ann_id": room_id,
+                    "room_bbox": f"({rx1:.1f},{ry1:.1f}) → ({rx2:.1f},{ry2:.1f})",
+                    "nearby_surrounder_count": len(nearby),
+                    "missing_sides": ", ".join(missing_sides) if missing_sides else "None (but 0 surrounders)",
+                    "nearby_ids": ", ".join(str(n["id"]) for n in nearby) if nearby else "—",
+                    "nearby_labels": ", ".join(sorted(set(n["label"] for n in nearby))) if nearby else "—",
+                    "has_gap": len(missing_sides) > 0 or len(nearby) == 0
+                })
+    return issues
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 4 – Annotations outside Floor plan
+# (same containment concept as Check 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5):
+    """
+    Same containment logic as Check 2: an annotation is "inside" a floor-plan
+    bbox when its own AABB is fully contained within the floor-plan AABB.
+
+    One image can have MULTIPLE floor-plan boxes (different building sections).
+    An annotation is only flagged as "outside" if it is NOT contained in ANY
+    of those floor-plan boxes.
+    """
+    issues = []
+    for item in items:
+        anns = item.get("annotations", [])
+        image_id = item.get("id", "")
+
+        floor_anns = [a for a in anns
+                      if label_map.get(a.get("label_id", -1)) == floor_label]
+        if not floor_anns:
+            continue
+
+        # Compute area for each floor-plan box (shown in results)
+        floor_boxes = []
+        for fp in floor_anns:
+            fp_box = annotation_aabb(fp)
+            if fp_box:
+                floor_boxes.append((fp, fp_box, _annotation_area(fp)))
+
+        if not floor_boxes:
+            continue
+
+        for a in anns:
+            a_name = label_map.get(a.get("label_id", -1), "")
+            if a_name == floor_label:
+                continue
+            a_box = annotation_aabb(a)
+            if a_box is None:
+                continue
+            a_area = _annotation_area(a)
+
+            # Inside if fully contained in ANY floor-plan box
+            in_any = any(
+                child_fully_inside_parent(a, fp_ann, tolerance=tolerance)
+                for fp_ann, fp_box, fp_area in floor_boxes
+            )
+
+            if not in_any:
+                # Report closest floor-plan box for context
+                def dist_to_box(box):
+                    fx1, fy1, fx2, fy2 = box
+                    ax1, ay1, ax2, ay2 = a_box
+                    return (max(0, fx1 - ax2, ax1 - fx2) +
+                            max(0, fy1 - ay2, ay1 - fy2))
+
+                closest_fp_ann, closest_fp_box, closest_fp_area = min(
+                    floor_boxes, key=lambda t: dist_to_box(t[1])
+                )
+                issues.append({
+                    "image_id": image_id,
+                    "num_floor_plan_boxes": len(floor_boxes),
+                    "closest_floor_area_px": round(closest_fp_area, 1),
+                    "closest_floor_bbox": (
+                        f"({closest_fp_box[0]:.1f},{closest_fp_box[1]:.1f})"
+                        f" → ({closest_fp_box[2]:.1f},{closest_fp_box[3]:.1f})"
+                    ),
+                    "offending_label": a_name,
+                    "offending_ann_id": a.get("id", "N/A"),
+                    "offending_type": a.get("type", ""),
+                    "offending_area_px": round(a_area, 1),
+                    "offending_bbox": (
+                        f"({a_box[0]:.1f},{a_box[1]:.1f})"
+                        f" → ({a_box[2]:.1f},{a_box[3]:.1f})"
+                    ),
+                })
+    return issues
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QC PAGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def annotation_qc_page():
+    st.title("🔍 Annotation QC")
+    st.markdown("Quality-check your Datumaro JSON annotations across four checks.")
+
+    uploaded_file = st.file_uploader(
+        "Upload a Datumaro JSON file",
+        type="json",
+        key="qc_uploader"
+    )
+
+    if uploaded_file is None:
+        st.info("👆 Upload a Datumaro JSON file to begin.")
+        return
+
+    try:
+        json_content = uploaded_file.read().decode("utf-8")
+        data = json.loads(json_content)
+    except Exception as e:
+        st.error(f"❌ Could not parse JSON: {e}")
+        return
+
+    label_map, name_to_id, items = parse_qc_data(json_content)
+    all_label_names = sorted(label_map.values())
+
+    if not items:
+        st.error("No items found in the JSON file.")
+        return
+
+    st.success(f"✅ Loaded **{len(items)}** image(s) with **{len(all_label_names)}** label(s).")
+    st.divider()
+
+    # ── Tabs for the 4 checks ─────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "✅ Check 1 – Label Summary",
+        "🔲 Check 2 – Nested Labels",
+        "🏠 Check 3 – Room Gap",
+        "📐 Check 4 – Floor Plan Containment"
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHECK 1 – Label summary
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab1:
+        st.subheader("✅ Label Annotation Summary")
+        st.markdown(
+            "A breakdown of how many **bounding-box** and **polygon** annotations "
+            "exist for every label across all images in this JSON."
+        )
+        df1 = qc_check1_label_summary(items, label_map)
+        if df1.empty:
+            st.warning("No annotations found.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Labels", len(df1))
+            c2.metric("Total BBoxes", int(df1["BBox"].sum()))
+            c3.metric("Total Polygons", int(df1["Polygon"].sum()))
+            st.divider()
+
+            # Optional per-image filter
+            image_ids = ["All images"] + [item.get("id", "") for item in items]
+            sel_img = st.selectbox("Filter by image:", image_ids, key="qc1_img")
+
+            if sel_img != "All images":
+                single_items = [i for i in items if i.get("id") == sel_img]
+                df1 = qc_check1_label_summary(single_items, label_map)
+
+            st.dataframe(df1, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHECK 2 – Nested labels
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab2:
+        st.subheader("🔲 Nested Labels inside a Selected Label")
+        st.markdown(
+            "Select a **parent label** (e.g. *Room*). The check will find every annotation "
+            "of that label and show which other labels' annotations overlap/are nested inside it. "
+            "Labels in the **ignore list** will be excluded from results."
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            parent_label = st.selectbox(
+                "Parent label to inspect:",
+                options=all_label_names,
+                index=all_label_names.index("Room") if "Room" in all_label_names else 0,
+                key="qc2_parent"
+            )
+        with col_b:
+            ignore_labels = st.multiselect(
+                "Ignore list (exclude these from nested results):",
+                options=[l for l in all_label_names if l != parent_label],
+                default=["Floor plan", "Legend"] if "Floor plan" in all_label_names else [],
+                key="qc2_ignore"
+            )
+
+        image_ids2 = ["All images"] + [item.get("id", "") for item in items]
+        sel_img2 = st.selectbox("Filter by image:", image_ids2, key="qc2_img")
+        check2_items = [i for i in items if i.get("id") == sel_img2] if sel_img2 != "All images" else items
+
+        if st.button("▶ Run Check 2", use_container_width=True, key="run_qc2"):
+            with st.spinner("Analysing nested labels…"):
+                results2 = qc_check2_nested_labels(check2_items, label_map, parent_label, set(ignore_labels))
+
+            if not results2:
+                st.warning(f"No '{parent_label}' annotations found.")
+            else:
+                df2 = pd.DataFrame([{
+                    "Image": r["image_id"],
+                    "Parent Type": r["parent_type"],
+                    "Parent BBox": r["parent_bbox"],
+                    "Parent Area (px²)": r["parent_area_px"],
+                    "Nested Count": r["nested_count"],
+                    "Nested Labels": r["nested_labels"]
+                } for r in results2])
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric(f"Total '{parent_label}' Annotations", len(results2))
+                c2.metric("With ≥1 Nested Label", int((df2["Nested Count"] > 0).sum()))
+                c3.metric("Total Nested Annotations", int(df2["Nested Count"].sum()))
+                st.divider()
+                st.dataframe(df2, use_container_width=True, hide_index=True)
+
+                # Drill-down expander — only show rows that have nested content
+                has_nested = [r for r in results2 if r["nested_details"]]
+                if has_nested:
+                    st.markdown("#### 🔍 Detailed Nested Items")
+                    for r in has_nested:
+                        with st.expander(
+                            f"📦 {r['image_id']} | Parent area={r['parent_area_px']:,.0f} px²"
+                            f" — {r['nested_count']} nested annotation(s): {r['nested_labels']}"
+                        ):
+                            nd_df = pd.DataFrame([{
+                                "Nested Label": n["nested_label"],
+                                "Type": n["nested_type"],
+                                "Area (px²)": n["nested_area_px"],
+                                "% of Parent Area": n["nested_area_pct"],
+                            } for n in r["nested_details"]])
+                            st.dataframe(nd_df, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHECK 3 – Room gap
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab3:
+        st.subheader("🏠 Room ↔ Surrounding Label Gap Check")
+        st.markdown(
+            "Each **Room** should be surrounded by walls, windows, and doors. "
+            "This check verifies that at least one surrounding label is present "
+            "on each of the four sides of every Room. Rooms with a missing side "
+            "are flagged as having a gap."
+        )
+
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            room_label = st.selectbox(
+                "Room label:",
+                options=all_label_names,
+                index=all_label_names.index("Room") if "Room" in all_label_names else 0,
+                key="qc3_room"
+            )
+        with col_r2:
+            surrounding_labels = st.multiselect(
+                "Surrounding labels (walls / windows / doors):",
+                options=[l for l in all_label_names if l != room_label],
+                default=[l for l in all_label_names if any(
+                    kw in l.lower() for kw in ["wall", "window", "door"]
+                )],
+                key="qc3_surrounding"
+            )
+
+        gap_thresh = st.slider(
+            "Gap tolerance (pixels) — surrounder must be within this distance of Room edge:",
+            min_value=1, max_value=100, value=15, key="qc3_thresh"
+        )
+
+        if st.button("▶ Run Check 3", use_container_width=True, key="run_qc3"):
+            if not surrounding_labels:
+                st.warning("Please select at least one surrounding label.")
+            else:
+                with st.spinner("Checking room gaps…"):
+                    issues3 = qc_check3_room_gap(items, label_map, room_label, set(surrounding_labels), gap_thresh)
+
+                room_anns_total = sum(
+                    1 for item in items for a in item.get("annotations", [])
+                    if label_map.get(a.get("label_id", -1)) == room_label
+                )
+                issues_with_gap = [i for i in issues3 if i["has_gap"]]
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Room Annotations", room_anns_total)
+                c2.metric("Rooms with Gaps ⚠️", len(issues_with_gap))
+                c3.metric("Rooms OK ✅", room_anns_total - len(issues_with_gap))
+                st.divider()
+
+                if not issues_with_gap:
+                    st.success("✅ No gap issues found! All rooms have surrounding labels on every side.")
+                else:
+                    st.error(f"⚠️ {len(issues_with_gap)} room(s) have gaps!")
+                    df3 = pd.DataFrame([{
+                        "Image": i["image_id"],
+                        "Room Ann ID": i["room_ann_id"],
+                        "Room BBox": i["room_bbox"],
+                        "Missing Sides": i["missing_sides"],
+                        "Nearby Surrounder Count": i["nearby_surrounder_count"],
+                        "Nearby Labels": i["nearby_labels"],
+                        "Nearby IDs": i["nearby_ids"]
+                    } for i in issues_with_gap])
+                    st.dataframe(df3, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHECK 4 – Floor plan containment
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab4:
+        st.subheader("📐 Floor Plan Containment Check")
+        st.markdown(
+            "The **Floor plan** label should act as an outer boundary that contains "
+            "all other annotations. This check finds any annotation whose bounding box "
+            "extends outside the Floor plan polygon's bounding box."
+        )
+
+        floor_label = st.selectbox(
+            "Floor plan label:",
+            options=all_label_names,
+            index=all_label_names.index("Floor plan") if "Floor plan" in all_label_names else 0,
+            key="qc4_floor"
+        )
+        tol4 = st.slider(
+            "Containment tolerance (pixels) — allow this much overshoot before flagging:",
+            min_value=0, max_value=50, value=5, key="qc4_tol"
+        )
+
+        image_ids4 = ["All images"] + [item.get("id", "") for item in items]
+        sel_img4 = st.selectbox("Filter by image:", image_ids4, key="qc4_img")
+        check4_items = [i for i in items if i.get("id") == sel_img4] if sel_img4 != "All images" else items
+
+        if st.button("▶ Run Check 4", use_container_width=True, key="run_qc4"):
+            with st.spinner("Checking floor plan containment…"):
+                issues4 = qc_check4_outside_floor_plan(check4_items, label_map, floor_label, tol4)
+
+            images_with_floor = sum(
+                1 for item in check4_items
+                if any(label_map.get(a.get("label_id", -1)) == floor_label for a in item.get("annotations", []))
+            )
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Images with Floor Plan", images_with_floor)
+            c2.metric("Violations Found ⚠️", len(issues4))
+            c3.metric("Unique Images Affected", len(set(i["image_id"] for i in issues4)))
+            st.divider()
+
+            if not issues4:
+                st.success("✅ All annotations are inside the Floor plan boundary!")
+            else:
+                st.error(f"⚠️ {len(issues4)} annotation(s) found outside the Floor plan!")
+                df4 = pd.DataFrame([{
+                    "Image": i["image_id"],
+                    "Floor Plan Boxes in Image": i["num_floor_plan_boxes"],
+                    "Closest Floor Area (px²)": i["closest_floor_area_px"],
+                    "Closest Floor BBox": i["closest_floor_bbox"],
+                    "Offending Label": i["offending_label"],
+                    "Offending Type": i["offending_type"],
+                    "Offending Area (px²)": i["offending_area_px"],
+                    "Offending BBox": i["offending_bbox"],
+                } for i in issues4])
+
+                # Group by image for clarity
+                affected_images = df4["Image"].unique()
+                for img in affected_images:
+                    with st.expander(f"🖼️ {img} — {len(df4[df4['Image']==img])} violation(s)"):
+                        st.dataframe(
+                            df4[df4["Image"] == img].drop(columns=["Image"]),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                st.divider()
+                st.subheader("📋 All Violations (flat table)")
+                st.dataframe(df4, use_container_width=True, hide_index=True)
+
+
 def main():
     st.set_page_config(page_title="Datumaro Tools", layout="wide")
 
@@ -1042,7 +1690,12 @@ def main():
         st.markdown("**Select a Page:**")
         page = st.radio(
             "page_nav",
-            ["📊 Annotation Converter", "🔷 Polygon Point Counter", "🔀 JSON Split & Merge"],
+            [
+                "📊 Annotation Converter",
+                "🔷 Polygon Point Counter",
+                "🔀 JSON Split & Merge",
+                "🔍 Annotation QC"
+            ],
             label_visibility="collapsed"
         )
         st.markdown("---")
@@ -1052,13 +1705,17 @@ def main():
         st.caption("Analyze per-polygon vertex (point) counts.")
         st.markdown("**🔀 JSON Split & Merge**")
         st.caption("Filter annotations by label or merge multiple JSON files.")
+        st.markdown("**🔍 Annotation QC**")
+        st.caption("Run 4 quality checks on your Datumaro JSON annotations.")
 
     if page == "📊 Annotation Converter":
         annotation_converter_page()
     elif page == "🔷 Polygon Point Counter":
         polygon_point_counter_page()
-    else:
+    elif page == "🔀 JSON Split & Merge":
         json_split_merge_page()
+    else:
+        annotation_qc_page()
 
 
 if __name__ == "__main__":
