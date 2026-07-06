@@ -1086,8 +1086,35 @@ def parse_qc_data(json_data):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHECK 1 – Label summary (bbox / polygon counts per label)
+# CHECK 1 – Wrong annotation type for a label
 # ─────────────────────────────────────────────────────────────────────────────
+
+def qc_check1_wrong_type(items, label_map, label_name, expected_type):
+    """
+    Find annotations of *label_name* that are of the OPPOSITE type than
+    *expected_type*.  Returns a list of dicts with frame_id, image_name,
+    label_name, wrong_type and count (only items with count > 0).
+    """
+    wrong_type = "polygon" if expected_type == "bbox" else "bbox"
+    results = []
+    for frame_id, item in enumerate(items):
+        image_name = item.get("id", "")
+        count = 0
+        for ann in item.get("annotations", []):
+            lid = ann.get("label_id", -1)
+            name = label_map.get(lid, f"Unknown_{lid}")
+            if name == label_name and ann.get("type", "") == wrong_type:
+                count += 1
+        if count > 0:
+            results.append({
+                "frame_id": frame_id,
+                "image_name": image_name,
+                "label_name": label_name,
+                "wrong_type": wrong_type,
+                "count": count,
+            })
+    return results
+
 
 def qc_check1_label_summary(items, label_map):
     """Return a DataFrame: label | bbox_count | polygon_count | total."""
@@ -1428,40 +1455,67 @@ def annotation_qc_page():
 
     # ── Tabs for the 4 checks ─────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs([
-        "✅ Check 1 – Label Summary",
+        "✅ Check 1 – Wrong Annotation Type",
         "🔲 Check 2 – Nested Labels",
         "🏠 Check 3 – Room Gap",
         "📐 Check 4 – Floor Plan Containment"
     ])
 
     # ══════════════════════════════════════════════════════════════════════════
-    # CHECK 1 – Label summary
+    # CHECK 1 – Wrong annotation type for a label
     # ══════════════════════════════════════════════════════════════════════════
     with tab1:
-        st.subheader("✅ Label Annotation Summary")
+        st.subheader("✅ Wrong Annotation Type Check")
         st.markdown(
-            "A breakdown of how many **bounding-box** and **polygon** annotations "
-            "exist for every label across all images in this JSON."
+            "Select a **label** and the **expected annotation type**. "
+            "This check finds images where that label has annotations of the "
+            "**opposite** type (e.g. bbox annotations when polygon is expected, "
+            "or vice versa)."
         )
-        df1 = qc_check1_label_summary(items, label_map)
-        if df1.empty:
-            st.warning("No annotations found.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Labels", len(df1))
-            c2.metric("Total BBoxes", int(df1["BBox"].sum()))
-            c3.metric("Total Polygons", int(df1["Polygon"].sum()))
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            sel_label = st.selectbox(
+                "Select label:",
+                options=all_label_names,
+                key="qc1_label"
+            )
+        with col_b:
+            sel_expected = st.selectbox(
+                "Expected annotation type:",
+                options=["BBox", "Polygon"],
+                key="qc1_expected_type"
+            )
+
+        if st.button("▶ Run Check 1", use_container_width=True, key="run_qc1"):
+            expected_type = "bbox" if sel_expected == "BBox" else "polygon"
+            wrong_type = "polygon" if expected_type == "bbox" else "bbox"
+            with st.spinner("Checking for wrong annotation types…"):
+                results1 = qc_check1_wrong_type(items, label_map, sel_label, expected_type)
+
+            total_wrong = sum(r["count"] for r in results1)
+
+            c1, c2 = st.columns(2)
+            c1.metric("Images with Wrong Type", len(results1))
+            c2.metric(f"Total {wrong_type.title()} Annotations Found", total_wrong)
             st.divider()
 
-            # Optional per-image filter
-            image_ids = ["All images"] + [item.get("id", "") for item in items]
-            sel_img = st.selectbox("Filter by image:", image_ids, key="qc1_img")
-
-            if sel_img != "All images":
-                single_items = [i for i in items if i.get("id") == sel_img]
-                df1 = qc_check1_label_summary(single_items, label_map)
-
-            st.dataframe(df1, use_container_width=True, hide_index=True)
+            if not results1:
+                st.success(f"✅ No {wrong_type} annotations found for label '{sel_label}'.")
+            else:
+                st.warning(
+                    f"⚠️ Found **{total_wrong}** {wrong_type} annotation(s) for label "
+                    f"'{sel_label}' across **{len(results1)}** image(s) "
+                    f"(expected type: {expected_type})."
+                )
+                df1 = pd.DataFrame([{
+                    "Frame ID": r["frame_id"],
+                    "Image Name": r["image_name"],
+                    "Label": r["label_name"],
+                    "Wrong Type": r["wrong_type"],
+                    "Count": r["count"],
+                } for r in results1])
+                st.dataframe(df1, use_container_width=True, hide_index=True)
 
     # ══════════════════════════════════════════════════════════════════════════
     # CHECK 2 – Nested labels
