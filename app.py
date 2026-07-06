@@ -1540,7 +1540,7 @@ def annotation_qc_page():
             ignore_labels = st.multiselect(
                 "Ignore list (exclude these from nested results):",
                 options=[l for l in all_label_names if l != parent_label],
-                default=["Floor plan", "Legend"] if "Floor plan" in all_label_names else [],
+                default=[l for l in ["Floor plan", "Legend", "Sink", "Toilet", "Cooktops","Urinals", "Stairs", "Bathtub", "Shower", "Doors","Shower Door", "Sliding Door", "Single Swing Door", "Closet Door", "Double Swing Door"] if l in all_label_names and l != parent_label],
                 key="qc2_ignore"
             )
 
@@ -1552,41 +1552,41 @@ def annotation_qc_page():
             with st.spinner("Analysing nested labels…"):
                 results2 = qc_check2_nested_labels(check2_items, label_map, parent_label, set(ignore_labels))
 
+            has_nested = [r for r in results2 if r["nested_details"]]
             if not results2:
                 st.warning(f"No '{parent_label}' annotations found.")
+            elif not has_nested:
+                st.info(f"No nested labels found inside any '{parent_label}' annotation.")
             else:
                 df2 = pd.DataFrame([{
                     "Image": r["image_id"],
-                    "Parent Type": r["parent_type"],
-                    "Parent BBox": r["parent_bbox"],
-                    "Parent Area (px²)": r["parent_area_px"],
-                    "Nested Count": r["nested_count"],
+                    "Frame ID": r["parent_ann_id"],
+                    "Label Type": r["parent_type"],
                     "Nested Labels": r["nested_labels"]
-                } for r in results2])
+                } for r in has_nested])
 
+                total_nested = sum(r["nested_count"] for r in has_nested)
                 c1, c2, c3 = st.columns(3)
                 c1.metric(f"Total '{parent_label}' Annotations", len(results2))
-                c2.metric("With ≥1 Nested Label", int((df2["Nested Count"] > 0).sum()))
-                c3.metric("Total Nested Annotations", int(df2["Nested Count"].sum()))
+                c2.metric("With ≥1 Nested Label", len(has_nested))
+                c3.metric("Total Nested Annotations", total_nested)
                 st.divider()
                 st.dataframe(df2, use_container_width=True, hide_index=True)
 
-                # Drill-down expander — only show rows that have nested content
-                has_nested = [r for r in results2 if r["nested_details"]]
-                if has_nested:
-                    st.markdown("#### 🔍 Detailed Nested Items")
-                    for r in has_nested:
-                        with st.expander(
-                            f"📦 {r['image_id']} | Parent area={r['parent_area_px']:,.0f} px²"
-                            f" — {r['nested_count']} nested annotation(s): {r['nested_labels']}"
-                        ):
-                            nd_df = pd.DataFrame([{
-                                "Nested Label": n["nested_label"],
-                                "Type": n["nested_type"],
-                                "Area (px²)": n["nested_area_px"],
-                                "% of Parent Area": n["nested_area_pct"],
-                            } for n in r["nested_details"]])
-                            st.dataframe(nd_df, use_container_width=True, hide_index=True)
+                # Drill-down expander
+                st.markdown("#### 🔍 Detailed Nested Items")
+                for r in has_nested:
+                    with st.expander(
+                        f"📦 {r['image_id']} | Frame {r['parent_ann_id']} | Parent area={r['parent_area_px']:,.0f} px²"
+                        f" — {r['nested_count']} nested annotation(s): {r['nested_labels']}"
+                    ):
+                        nd_df = pd.DataFrame([{
+                            "Nested Label": n["nested_label"],
+                            "Type": n["nested_type"],
+                            "Area (px²)": n["nested_area_px"],
+                            "% of Parent Area": n["nested_area_pct"],
+                        } for n in r["nested_details"]])
+                        st.dataframe(nd_df, use_container_width=True, hide_index=True)
 
     # ══════════════════════════════════════════════════════════════════════════
     # CHECK 3 – Room gap
