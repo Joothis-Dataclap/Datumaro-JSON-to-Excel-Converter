@@ -1343,7 +1343,7 @@ def qc_check3_room_gap(items, label_map, room_label, surrounding_labels, gap_thr
 # (same containment concept as Check 2)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5):
+def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5, ignore_labels=None):
     """
     Same containment logic as Check 2: an annotation is "inside" a floor-plan
     bbox when its own AABB is fully contained within the floor-plan AABB.
@@ -1351,7 +1351,12 @@ def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5):
     One image can have MULTIPLE floor-plan boxes (different building sections).
     An annotation is only flagged as "outside" if it is NOT contained in ANY
     of those floor-plan boxes.
+
+    Labels in *ignore_labels* are skipped entirely.
     """
+    if ignore_labels is None:
+        ignore_labels = set()
+    ignore_labels = set(ignore_labels)
     issues = []
     for item in items:
         anns = item.get("annotations", [])
@@ -1375,6 +1380,8 @@ def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5):
         for a in anns:
             a_name = label_map.get(a.get("label_id", -1), "")
             if a_name == floor_label:
+                continue
+            if a_name in ignore_labels:
                 continue
             a_box = annotation_aabb(a)
             if a_box is None:
@@ -1674,6 +1681,12 @@ def annotation_qc_page():
             index=all_label_names.index("Floor plan") if "Floor plan" in all_label_names else 0,
             key="qc4_floor"
         )
+        ignore_labels4 = st.multiselect(
+            "Ignore list (exclude these from containment check):",
+            options=[l for l in all_label_names if l != floor_label],
+            default=[l for l in ["Legend"] if l in all_label_names and l != floor_label],
+            key="qc4_ignore"
+        )
         tol4 = st.slider(
             "Containment tolerance (pixels) — allow this much overshoot before flagging:",
             min_value=0, max_value=50, value=5, key="qc4_tol"
@@ -1685,7 +1698,7 @@ def annotation_qc_page():
 
         if st.button("▶ Run Check 4", use_container_width=True, key="run_qc4"):
             with st.spinner("Checking floor plan containment…"):
-                issues4 = qc_check4_outside_floor_plan(check4_items, label_map, floor_label, tol4)
+                issues4 = qc_check4_outside_floor_plan(check4_items, label_map, floor_label, tol4, ignore_labels4)
 
             images_with_floor = sum(
                 1 for item in check4_items
@@ -1704,27 +1717,10 @@ def annotation_qc_page():
                 st.error(f"⚠️ {len(issues4)} annotation(s) found outside the Floor plan!")
                 df4 = pd.DataFrame([{
                     "Image": i["image_id"],
-                    "Floor Plan Boxes in Image": i["num_floor_plan_boxes"],
-                    "Closest Floor Area (px²)": i["closest_floor_area_px"],
-                    "Closest Floor BBox": i["closest_floor_bbox"],
+                    "Frame ID": idx,
                     "Offending Label": i["offending_label"],
-                    "Offending Type": i["offending_type"],
-                    "Offending Area (px²)": i["offending_area_px"],
-                    "Offending BBox": i["offending_bbox"],
-                } for i in issues4])
+                } for idx, i in enumerate(issues4)])
 
-                # Group by image for clarity
-                affected_images = df4["Image"].unique()
-                for img in affected_images:
-                    with st.expander(f"🖼️ {img} — {len(df4[df4['Image']==img])} violation(s)"):
-                        st.dataframe(
-                            df4[df4["Image"] == img].drop(columns=["Image"]),
-                            use_container_width=True,
-                            hide_index=True
-                        )
-
-                st.divider()
-                st.subheader("📋 All Violations (flat table)")
                 st.dataframe(df4, use_container_width=True, hide_index=True)
 
 
