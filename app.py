@@ -201,6 +201,7 @@ def parse_polygon_points_data(json_data):
         items = data.get("items", [])
         polygon_rows = []
 
+        global_counter = 1
         for item in items:
             image_name = item.get("id", "")
             annotations = item.get("annotations", [])
@@ -209,7 +210,7 @@ def parse_polygon_points_data(json_data):
                 if annotation.get("type", "") == "polygon":
                     label_id = annotation.get("label_id", -1)
                     label_name = label_map.get(label_id, f"Unknown_{label_id}")
-                    polygon_id = annotation.get("id", "N/A")
+                    polygon_id = global_counter
                     points = annotation.get("points", [])
                     points_count = len(points) // 2
 
@@ -219,6 +220,7 @@ def parse_polygon_points_data(json_data):
                         "polygon_id": polygon_id,
                         "points_count": points_count
                     })
+                global_counter += 1
 
         return polygon_rows
 
@@ -1075,14 +1077,20 @@ def parse_qc_data(json_data):
     Parse Datumaro JSON and return:
       - label_map: {id -> name}
       - name_to_id: {name -> id}
-      - items: raw items list
+      - items: raw items list (each annotation gets _ann_number = global 1-based index)
     """
     data = json.loads(json_data) if isinstance(json_data, str) else json_data
     label_map = {}
     if "categories" in data and "label" in data["categories"]:
         for idx, lbl in enumerate(data["categories"]["label"].get("labels", [])):
             label_map[idx] = lbl.get("name", f"Label_{idx}")
-    return label_map, {v: k for k, v in label_map.items()}, data.get("items", [])
+    items = data.get("items", [])
+    global_counter = 1
+    for item in items:
+        for ann in item.get("annotations", []):
+            ann["_ann_number"] = global_counter
+            global_counter += 1
+    return label_map, {v: k for k, v in label_map.items()}, items
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1101,12 +1109,12 @@ def qc_check1_wrong_type(items, label_map, label_name, expected_type):
         image_name = item.get("id", "")
         count = 0
         ann_ids = []
-        for ann_idx, ann in enumerate(item.get("annotations", []), start=1):
+        for ann in item.get("annotations", []):
             lid = ann.get("label_id", -1)
             name = label_map.get(lid, f"Unknown_{lid}")
             if name == label_name and ann.get("type", "") == wrong_type:
                 count += 1
-                ann_ids.append(str(ann_idx))
+                ann_ids.append(str(ann.get("_ann_number", "N/A")))
         if count > 0:
             results.append({
                 "frame_id": frame_id,
@@ -1236,14 +1244,11 @@ def qc_check2_nested_labels(items, label_map, parent_label_name, ignore_labels, 
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
 
-        # Build per-image 1-based annotation index map
-        ann_local_ids = {id(ann): idx for idx, ann in enumerate(anns, start=1)}
-
         parents = [a for a in anns
                    if label_map.get(a.get("label_id", -1)) == parent_label_name]
 
         for p_ann in parents:
-            p_id = ann_local_ids.get(id(p_ann), "N/A")
+            p_id = p_ann.get("_ann_number", "N/A")
             p_area = _annotation_area(p_ann)
             p_box = annotation_aabb(p_ann)
             nested = []
@@ -1258,7 +1263,7 @@ def qc_check2_nested_labels(items, label_map, parent_label_name, ignore_labels, 
                     a_area = _annotation_area(a)
                     nested.append({
                         "nested_label": a_name,
-                        "nested_id": ann_local_ids.get(id(a), "N/A"),
+                        "nested_id": a.get("_ann_number", "N/A"),
                         "nested_type": a.get("type", ""),
                         "nested_area_px": round(a_area, 1),
                         "nested_area_pct": round(a_area / p_area * 100, 2) if p_area > 0 else 0.0,
@@ -1297,16 +1302,13 @@ def qc_check3_empty_rooms(items, label_map, room_label, ignore_labels=None):
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
 
-        # Build per-image 1-based annotation index map
-        ann_local_ids = {id(ann): idx for idx, ann in enumerate(anns, start=1)}
-
         rooms = [a for a in anns if label_map.get(a.get("label_id", -1)) == room_label]
 
         for room in rooms:
             r_box = annotation_aabb(room)
             if r_box is None:
                 continue
-            room_id = ann_local_ids.get(id(room), "N/A")
+            room_id = room.get("_ann_number", "N/A")
 
             has_nested = False
             for a in anns:
@@ -1343,9 +1345,6 @@ def qc_check3_room_gap(items, label_map, room_label, surrounding_labels, gap_thr
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
 
-        # Build per-image 1-based annotation index map
-        ann_local_ids = {id(ann): idx for idx, ann in enumerate(anns, start=1)}
-
         rooms = [a for a in anns if label_map.get(a.get("label_id", -1)) == room_label]
         surrounders = [a for a in anns if label_map.get(a.get("label_id", -1)) in surrounding_labels]
 
@@ -1354,7 +1353,7 @@ def qc_check3_room_gap(items, label_map, room_label, surrounding_labels, gap_thr
             if r_box is None:
                 continue
             rx1, ry1, rx2, ry2 = r_box
-            room_id = ann_local_ids.get(id(room), "N/A")
+            room_id = room.get("_ann_number", "N/A")
 
             gaps = []
             nearby = []
@@ -1368,7 +1367,7 @@ def qc_check3_room_gap(items, label_map, room_label, surrounding_labels, gap_thr
                             rx2 + gap_threshold, ry2 + gap_threshold)
                 if aabb_overlap(expanded, s_box):
                     nearby.append({
-                        "id": ann_local_ids.get(id(s), "N/A"),
+                        "id": s.get("_ann_number", "N/A"),
                         "label": label_map.get(s.get("label_id", -1), ""),
                         "type": s.get("type", ""),
                         "bbox": s_box
@@ -1420,9 +1419,6 @@ def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5, ign
     for item in items:
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
-
-        # Build per-image 1-based annotation index map
-        ann_local_ids = {id(ann): idx for idx, ann in enumerate(anns, start=1)}
 
         floor_anns = [a for a in anns
                       if label_map.get(a.get("label_id", -1)) == floor_label]
@@ -1476,7 +1472,7 @@ def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5, ign
                         f" → ({closest_fp_box[2]:.1f},{closest_fp_box[3]:.1f})"
                     ),
                     "offending_label": a_name,
-                    "offending_ann_id": ann_local_ids.get(id(a), "N/A"),
+                    "offending_ann_id": a.get("_ann_number", "N/A"),
                     "offending_type": a.get("type", ""),
                     "offending_area_px": round(a_area, 1),
                     "offending_bbox": (
@@ -1485,6 +1481,60 @@ def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5, ign
                     ),
                 })
     return issues
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 4 – Label inside Room
+# ─────────────────────────────────────────────────────────────────────────────
+
+def qc_check4_label_inside_room(items, label_map, target_labels, room_label):
+    """
+    Find annotations of any label in *target_labels* that are fully contained
+    inside any Room annotation.  Uses child_fully_inside_parent containment logic.
+    Returns (inside_results, outside_results) where:
+      - inside_results: list of dicts with image_id, frame_id, ann_id, label_name, ann_type, inside_room_id, room_bbox
+      - outside_results: list of dicts with image_id, frame_id, ann_id, label_name, ann_type
+    """
+    target_labels = set(target_labels)
+    inside_results = []
+    outside_results = []
+    for frame_id, item in enumerate(items):
+        anns = item.get("annotations", [])
+        image_id = item.get("id", "")
+
+        rooms = [a for a in anns if label_map.get(a.get("label_id", -1)) == room_label]
+        targets = [a for a in anns
+                   if label_map.get(a.get("label_id", -1)) in target_labels]
+
+        for a in targets:
+            a_id = a.get("_ann_number", "N/A")
+            a_name = label_map.get(a.get("label_id", -1), "")
+            a_type = a.get("type", "")
+            found_inside = False
+            for room in rooms:
+                if child_fully_inside_parent(a, room):
+                    r_box = annotation_aabb(room)
+                    inside_results.append({
+                        "image_id": image_id,
+                        "frame_id": frame_id,
+                        "ann_id": a_id,
+                        "label_name": a_name,
+                        "ann_type": a_type,
+                        "inside_room_id": room.get("_ann_number", "N/A"),
+                        "room_bbox": (f"({r_box[0]:.1f},{r_box[1]:.1f})"
+                                      f" → ({r_box[2]:.1f},{r_box[3]:.1f})") if r_box else "N/A",
+                    })
+                    found_inside = True
+                    break
+            if not found_inside:
+                outside_results.append({
+                    "image_id": image_id,
+                    "frame_id": frame_id,
+                    "ann_id": a_id,
+                    "label_name": a_name,
+                    "ann_type": a_type,
+                })
+    return inside_results, outside_results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1522,11 +1572,12 @@ def annotation_qc_page():
     st.success(f"✅ Loaded **{len(items)}** image(s) with **{len(all_label_names)}** label(s).")
     st.divider()
 
-    # ── Tabs for the 3 checks ─────────────────────────────────────────────────
-    tab1, tab2, tab3 = st.tabs([
+    # ── Tabs for the 4 checks ─────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs([
         "✅ Check 1 – Wrong Annotation Type",
         "🔲 Check 2 – Containment Check",
-        "🏠 Check 3 – Room Gap"
+        "🏠 Check 3 – Room Gap",
+        "📋 Check 4 – Label Inside Room"
     ])
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1848,6 +1899,84 @@ def annotation_qc_page():
                         "Room BBox": r["room_bbox"],
                     } for r in empty_rooms])
                     st.dataframe(df_empty, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHECK 4 – Label inside Room
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab4:
+        st.subheader("📋 Label Inside Room Check")
+        st.markdown(
+            "Select one or more **labels** to check and a **Room label**. "
+            "This check finds all annotations of the selected label(s) that are "
+            "**inside** a Room annotation, confirming proper containment."
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            target_labels_qc4 = st.multiselect(
+                "Select label(s) to check:",
+                options=all_label_names,
+                key="qc4_target_labels"
+            )
+        with col_b:
+            room_label_qc4 = st.selectbox(
+                "Room label:",
+                options=all_label_names,
+                index=all_label_names.index("Room") if "Room" in all_label_names else 0,
+                key="qc4_room_label"
+            )
+
+        image_ids_qc4 = ["All images"] + [item.get("id", "") for item in items]
+        sel_img_qc4 = st.selectbox("Filter by image:", image_ids_qc4, key="qc4_img")
+        check4_items = [i for i in items if i.get("id") == sel_img_qc4] if sel_img_qc4 != "All images" else items
+
+        if st.button("▶ Run Check", use_container_width=True, key="run_qc4_inside"):
+            if not target_labels_qc4:
+                st.warning("Please select at least one label to check.")
+            else:
+                with st.spinner("Checking label containment inside rooms…"):
+                    inside_results, outside_results = qc_check4_label_inside_room(
+                        check4_items, label_map, target_labels_qc4, room_label_qc4
+                    )
+
+                total_target = sum(
+                    1 for item in check4_items for a in item.get("annotations", [])
+                    if label_map.get(a.get("label_id", -1)) in set(target_labels_qc4)
+                )
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Selected Label Annotations", total_target)
+                c2.metric("Found Inside Room ✅", len(inside_results))
+                c3.metric("Not Inside Room ⚠️", len(outside_results))
+                st.divider()
+
+                if inside_results:
+                    st.success(f"Found **{len(inside_results)}** annotation(s) inside '{room_label_qc4}'.")
+                    df4_inside = pd.DataFrame([{
+                        "Image": r["image_id"],
+                        "Frame ID": r["frame_id"],
+                        "Annotation ID": r["ann_id"],
+                        "Label": r["label_name"],
+                        "Type": r["ann_type"],
+                        "Inside Room Ann ID": r["inside_room_id"],
+                        "Room BBox": r["room_bbox"],
+                    } for r in inside_results])
+                    st.dataframe(df4_inside, use_container_width=True, hide_index=True)
+
+                st.divider()
+
+                if outside_results:
+                    st.error(f"⚠️ **{len(outside_results)}** annotation(s) NOT inside any '{room_label_qc4}'!")
+                    df4_outside = pd.DataFrame([{
+                        "Image": r["image_id"],
+                        "Frame ID": r["frame_id"],
+                        "Annotation ID": r["ann_id"],
+                        "Label": r["label_name"],
+                        "Type": r["ann_type"],
+                    } for r in outside_results])
+                    st.dataframe(df4_outside, use_container_width=True, hide_index=True)
+                else:
+                    st.info("All selected label annotations are inside a room.")
 
 
 def main():
