@@ -6,6 +6,50 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
 import time
+import re
+
+
+def extract_frame_number(item_or_id, fallback_index=0):
+    """
+    Try to extract the original video frame number from a Datumaro item.
+    Priority:
+      1. item['attr']['frame'] (real video frame index)
+      2. item['image']['path'] (last numeric group, e.g. original-40.png -> 40)
+      3. item['id'] string (last numeric group)
+      4. fallback_index (1-based JSON position)
+    """
+    if isinstance(item_or_id, dict):
+        item = item_or_id
+        # 1. Datumaro stores the real frame number in attr.frame
+        attr = item.get("attr", {})
+        if "frame" in attr:
+            try:
+                return int(attr["frame"])
+            except (ValueError, TypeError):
+                pass
+        # 2. Try the image path
+        img_path = item.get("image", {}).get("path", "")
+        if img_path:
+            val = extract_frame_number(img_path, fallback_index=-1)
+            if val != -1:
+                return val
+        # 3. Fall back to the item id string
+        item_id = item.get("id", "")
+        if item_id:
+            val = extract_frame_number(item_id, fallback_index=-1)
+            if val != -1:
+                return val
+        return fallback_index
+
+    item_id = item_or_id
+    if item_id:
+        match = re.search(r"\D(\d+)(?:\.\w+)?$", item_id)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"(\d+)(?:\.\w+)?$", item_id)
+        if match:
+            return int(match.group(1))
+    return fallback_index
 
 
 @st.cache_data
@@ -28,9 +72,10 @@ def parse_datumaro_json(json_data):
         items = data.get("items", [])
         annotations_data = []
         
-        for frame_number, item in enumerate(items, start=0):
+        for json_index, item in enumerate(items, start=1):
             image_name = item.get("id", "")
-            
+            frame_number = extract_frame_number(item, fallback_index=json_index)
+
             # Extract annotations for this image
             annotations = item.get("annotations", [])
             label_counts = {}
@@ -187,7 +232,7 @@ def create_excel_with_labels(json_data):
 def parse_polygon_points_data(json_data):
     """
     Parse Datumaro JSON and extract per-polygon point data.
-    Returns list of dicts: image_name, label_name, polygon_id, points_count
+    Returns list of dicts: image_name, frame_number, label_name, polygon_id, points_count
     """
     try:
         data = json.loads(json_data) if isinstance(json_data, str) else json_data
@@ -202,8 +247,9 @@ def parse_polygon_points_data(json_data):
         polygon_rows = []
 
         global_counter = 1
-        for item in items:
+        for json_index, item in enumerate(items, start=1):
             image_name = item.get("id", "")
+            frame_number = extract_frame_number(item, fallback_index=json_index)
             annotations = item.get("annotations", [])
 
             for annotation in annotations:
@@ -216,6 +262,7 @@ def parse_polygon_points_data(json_data):
 
                     polygon_rows.append({
                         "image_name": image_name,
+                        "frame_number": frame_number,
                         "label_name": label_name,
                         "polygon_id": polygon_id,
                         "points_count": points_count
@@ -456,9 +503,9 @@ def polygon_point_counter_page():
             # Filter polygon_rows based on selected labels
             filtered_polygon_rows = [row for row in polygon_rows if row["label_name"] in selected_labels]
 
-            df = pd.DataFrame(filtered_polygon_rows)[["image_name", "label_name", "points_count"]].copy()
+            df = pd.DataFrame(filtered_polygon_rows)[["image_name", "frame_number", "label_name", "points_count"]].copy()
             df.insert(0, "SI No", range(1, len(df) + 1))
-            df.columns = ["SI No", "Image Name", "Label Name", "Points Count"]
+            df.columns = ["SI No", "Image Name", "Frame Number", "Label Name", "Points Count"]
 
             st.divider()
 
@@ -479,7 +526,7 @@ def polygon_point_counter_page():
                 ws = wb_poly.active
                 ws.title = "Polygon Points"
 
-                poly_headers = ["SI No", "Image Name", "Label Name", "Points Count"]
+                poly_headers = ["SI No", "Image Name", "Frame Number", "Label Name", "Points Count"]
                 ws.append(poly_headers)
 
                 header_fill = PatternFill(start_color="7030A0", end_color="7030A0", fill_type="solid")
@@ -502,6 +549,7 @@ def polygon_point_counter_page():
                     ws.append([
                         int(row_data["SI No"]),
                         row_data["Image Name"],
+                        int(row_data["Frame Number"]),
                         row_data["Label Name"],
                         int(row_data["Points Count"])
                     ])
@@ -918,6 +966,20 @@ def json_split_merge_page():
 
                         st.divider()
 
+                        # Frame preview using original video frame numbers
+                        st.subheader("🎞️ Filtered Frame Preview")
+                        preview_rows = []
+                        for json_index, item in enumerate(filtered_data_selected.get("items", []), start=1):
+                            img_id = item.get("id", "")
+                            preview_rows.append({
+                                "Frame Number": extract_frame_number(item, fallback_index=json_index),
+                                "Image ID": img_id,
+                            })
+                        if preview_rows:
+                            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+                        st.divider()
+
                         # Download buttons
                         st.subheader("💾 Download Filtered JSONs")
                         col_dl1, col_dl2 = st.columns(2)
@@ -1077,7 +1139,8 @@ def parse_qc_data(json_data):
     Parse Datumaro JSON and return:
       - label_map: {id -> name}
       - name_to_id: {name -> id}
-      - items: raw items list (each annotation gets _ann_number = global 1-based index)
+      - items: raw items list (each annotation gets _ann_number = global 1-based index,
+        and each item gets _frame_number = original video frame number)
     """
     data = json.loads(json_data) if isinstance(json_data, str) else json_data
     label_map = {}
@@ -1086,7 +1149,8 @@ def parse_qc_data(json_data):
             label_map[idx] = lbl.get("name", f"Label_{idx}")
     items = data.get("items", [])
     global_counter = 1
-    for item in items:
+    for json_index, item in enumerate(items, start=1):
+        item["_frame_number"] = extract_frame_number(item, fallback_index=json_index)
         for ann in item.get("annotations", []):
             ann["_ann_number"] = global_counter
             global_counter += 1
@@ -1105,8 +1169,9 @@ def qc_check1_wrong_type(items, label_map, label_name, expected_type):
     """
     wrong_type = "polygon" if expected_type == "bbox" else "bbox"
     results = []
-    for frame_id, item in enumerate(items):
+    for item in items:
         image_name = item.get("id", "")
+        frame_id = item.get("_frame_number", 0)
         count = 0
         ann_ids = []
         for ann in item.get("annotations", []):
@@ -1243,6 +1308,7 @@ def qc_check2_nested_labels(items, label_map, parent_label_name, ignore_labels, 
     for item in items:
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
+        frame_id = item.get("_frame_number", 0)
 
         parents = [a for a in anns
                    if label_map.get(a.get("label_id", -1)) == parent_label_name]
@@ -1271,6 +1337,7 @@ def qc_check2_nested_labels(items, label_map, parent_label_name, ignore_labels, 
 
             results.append({
                 "image_id": image_id,
+                "frame_id": frame_id,
                 "parent_ann_id": p_id,
                 "parent_type": p_ann.get("type", ""),
                 "parent_area_px": round(p_area, 1),
@@ -1301,6 +1368,7 @@ def qc_check3_empty_rooms(items, label_map, room_label, ignore_labels=None):
     for item in items:
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
+        frame_id = item.get("_frame_number", 0)
 
         rooms = [a for a in anns if label_map.get(a.get("label_id", -1)) == room_label]
 
@@ -1324,6 +1392,7 @@ def qc_check3_empty_rooms(items, label_map, room_label, ignore_labels=None):
             if not has_nested:
                 empty_rooms.append({
                     "image_id": image_id,
+                    "frame_id": frame_id,
                     "room_ann_id": room_id,
                     "room_bbox": f"({r_box[0]:.1f},{r_box[1]:.1f}) → ({r_box[2]:.1f},{r_box[3]:.1f})",
                 })
@@ -1344,6 +1413,7 @@ def qc_check3_room_gap(items, label_map, room_label, surrounding_labels, gap_thr
     for item in items:
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
+        frame_id = item.get("_frame_number", 0)
 
         rooms = [a for a in anns if label_map.get(a.get("label_id", -1)) == room_label]
         surrounders = [a for a in anns if label_map.get(a.get("label_id", -1)) in surrounding_labels]
@@ -1385,6 +1455,7 @@ def qc_check3_room_gap(items, label_map, room_label, surrounding_labels, gap_thr
             if missing_sides or len(nearby) == 0:
                 issues.append({
                     "image_id": image_id,
+                    "frame_id": frame_id,
                     "room_ann_id": room_id,
                     "room_bbox": f"({rx1:.1f},{ry1:.1f}) → ({rx2:.1f},{ry2:.1f})",
                     "nearby_surrounder_count": len(nearby),
@@ -1419,6 +1490,7 @@ def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5, ign
     for item in items:
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
+        frame_id = item.get("_frame_number", 0)
 
         floor_anns = [a for a in anns
                       if label_map.get(a.get("label_id", -1)) == floor_label]
@@ -1465,6 +1537,7 @@ def qc_check4_outside_floor_plan(items, label_map, floor_label, tolerance=5, ign
                 )
                 issues.append({
                     "image_id": image_id,
+                    "frame_id": frame_id,
                     "num_floor_plan_boxes": len(floor_boxes),
                     "closest_floor_area_px": round(closest_fp_area, 1),
                     "closest_floor_bbox": (
@@ -1498,9 +1571,10 @@ def qc_check4_label_inside_room(items, label_map, target_labels, room_label):
     target_labels = set(target_labels)
     inside_results = []
     outside_results = []
-    for frame_id, item in enumerate(items):
+    for item in items:
         anns = item.get("annotations", [])
         image_id = item.get("id", "")
+        frame_id = item.get("_frame_number", 0)
 
         rooms = [a for a in anns if label_map.get(a.get("label_id", -1)) == room_label]
         targets = [a for a in anns
@@ -1687,6 +1761,7 @@ def annotation_qc_page():
                 else:
                     df2 = pd.DataFrame([{
                         "Image": r["image_id"],
+                        "Frame ID": r["frame_id"],
                         "Annotation ID": r["parent_ann_id"],
                         "Label Type": r["parent_type"],
                         "Nested Labels": r["nested_labels"]
@@ -1767,10 +1842,10 @@ def annotation_qc_page():
                     st.error(f"⚠️ {len(issues4)} annotation(s) found outside the Floor plan!")
                     df4 = pd.DataFrame([{
                         "Image": i["image_id"],
-                        "Frame ID": idx,
+                        "Frame ID": i["frame_id"],
                         "Annotation ID": i["offending_ann_id"],
                         "Offending Label": i["offending_label"],
-                    } for idx, i in enumerate(issues4)])
+                    } for i in issues4])
 
                     st.dataframe(df4, use_container_width=True, hide_index=True)
 
@@ -1841,6 +1916,7 @@ def annotation_qc_page():
                         st.error(f"⚠️ {len(issues_with_gap)} room(s) have gaps!")
                         df3 = pd.DataFrame([{
                             "Image": i["image_id"],
+                            "Frame ID": i["frame_id"],
                             "Annotation ID": i["room_ann_id"],
                             "Room BBox": i["room_bbox"],
                             "Missing Sides": i["missing_sides"],
@@ -1895,6 +1971,7 @@ def annotation_qc_page():
                     st.error(f"⚠️ {len(empty_rooms)} empty room(s) found!")
                     df_empty = pd.DataFrame([{
                         "Image": r["image_id"],
+                        "Frame ID": r["frame_id"],
                         "Annotation ID": r["room_ann_id"],
                         "Room BBox": r["room_bbox"],
                     } for r in empty_rooms])
@@ -1927,7 +2004,7 @@ def annotation_qc_page():
             )
 
         image_ids_qc4 = ["All images"] + [item.get("id", "") for item in items]
-        sel_img_qc4 = st.selectbox("Filter by image:", image_ids_qc4, key="qc4_img")
+        sel_img_qc4 = st.selectbox("Filter by image:", image_ids_qc4, key="qc4_inside_img")
         check4_items = [i for i in items if i.get("id") == sel_img_qc4] if sel_img_qc4 != "All images" else items
 
         if st.button("▶ Run Check", use_container_width=True, key="run_qc4_inside"):
@@ -1948,21 +2025,6 @@ def annotation_qc_page():
                 c1.metric("Total Selected Label Annotations", total_target)
                 c2.metric("Found Inside Room ✅", len(inside_results))
                 c3.metric("Not Inside Room ⚠️", len(outside_results))
-                st.divider()
-
-                if inside_results:
-                    st.success(f"Found **{len(inside_results)}** annotation(s) inside '{room_label_qc4}'.")
-                    df4_inside = pd.DataFrame([{
-                        "Image": r["image_id"],
-                        "Frame ID": r["frame_id"],
-                        "Annotation ID": r["ann_id"],
-                        "Label": r["label_name"],
-                        "Type": r["ann_type"],
-                        "Inside Room Ann ID": r["inside_room_id"],
-                        "Room BBox": r["room_bbox"],
-                    } for r in inside_results])
-                    st.dataframe(df4_inside, use_container_width=True, hide_index=True)
-
                 st.divider()
 
                 if outside_results:
